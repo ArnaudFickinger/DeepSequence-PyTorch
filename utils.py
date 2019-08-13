@@ -5,14 +5,10 @@ Code by: Arnaud Fickinger
 '''
 ###
 
-import torch
-# torch.manual_seed(42)
-import os
-from collections import defaultdict
 from loss import *
-from bs4 import BeautifulSoup
-import requests
 import numpy as np
+from model import *
+from collections import *
 
 from options import Options
 
@@ -23,8 +19,16 @@ def sample_diag_gaussian(mu, logvar): #reparametrization trick
     eps = torch.randn_like(std)
     return mu + eps * std
 
-def sample_diag_gaussian_original(mu, logsigma): #reparametrization trick
+def sample_diag_gaussian_original(mu, logsigma, k_iws = 1): #reparametrization trick
     std = torch.exp(logsigma)
+    # print("stdshape: {}".format(std.shape))
+    # if opt.IWS:
+    #     print("stdshape")
+    #     print(std.shape)
+        # std = std.unsqueeze(1)
+        # std = std.repeat(1, k_iws, 1)
+        # mu = mu.unsqueeze(1)
+        # mu = mu.repeat(1, k_iws, 1)
     eps = torch.randn_like(std)
     return mu + eps * std
 
@@ -40,10 +44,17 @@ def log_gaussian_logvar(x, mu, logvar):
 def log_gaussian_logsigma(x, mu, logsigma):
     return float(-0.5 * np.log(2 * np.pi)) - logsigma - (x - mu).pow(2) / torch.exp(logsigma)
 
+def log_sum_exp(tensor, dim=-1, sum_op=torch.sum):
+    max, _ = torch.max(tensor, dim=dim, keepdim=True)
+    return torch.log(sum_op(torch.exp(tensor - max), dim=dim, keepdim=True) + 1e-8) + max
+
+
+
 class DataHelper:
     def __init__(self,
         dataset,
         theta,
+        custom_dataset = False,
         alignment_file="",
         focus_seq_name="",
         calc_weights=True,
@@ -104,7 +115,11 @@ class DataHelper:
         self.load_all_sequences = load_all_sequences
 
         # Load necessary information for preloaded datasets
-        if self.dataset != "":
+
+        if custom_dataset:
+            self.alignment_file = dataset
+
+        elif self.dataset != "":
             self.configure_datasets()
 
         # Load up the alphabet type to use, whether that be DNA, RNA, or protein
@@ -129,7 +144,10 @@ class DataHelper:
 
     def configure_datasets(self):
 
-        if self.dataset == "BLAT_ECOLX":
+        if opt.test_algo:
+            self.alignment_file = self.working_dir + "/datasets/DLG4.a2m"
+
+        elif self.dataset == "BLAT_ECOLX":
             self.alignment_file = self.working_dir+"/datasets/BLAT_ECOLX_hmmerbit_plmc_n5_m30_f50_t0.2_r24-286_id100_b105.a2m"
 #             self.theta = 0.2
 
@@ -540,6 +558,202 @@ class DataHelper:
 
             OUTPUT.close()
 
+    def mutation_file_to_onehot(self, input_filename):
+        """ Predict the delta elbo for a custom mutation filename
+                """
+        # Get the start and end index from the sequence name
+        start_idx, end_idx = self.focus_seq_name.split("/")[-1].split("-")
+        start_idx = int(start_idx)
+
+        wt_pos_focus_idx_tuple_list = []
+        focus_seq_index = 0
+        focus_seq_list = []
+        mutant_to_letter_pos_idx_focus_list = {}
+
+        # find all possible valid mutations that can be run with this alignment
+        for i, letter in enumerate(self.focus_seq):
+            if letter == letter.upper():
+                for mut in self.alphabet:
+                    pos = start_idx + i
+                    if letter != mut:
+                        mutant = letter + str(pos) + mut
+                        mutant_to_letter_pos_idx_focus_list[mutant] = [letter, start_idx + i, focus_seq_index]
+                focus_seq_index += 1
+
+        self.mutant_sequences = ["".join(self.focus_seq_trimmed)]
+        self.mutant_sequences_descriptor = ["wt"]
+
+        # run through the input file
+        INPUT = open(input_filename, "r")
+        for i, line in enumerate(INPUT):
+            line = line.rstrip()
+            if i >= 1:
+                line_list = line.split(",")
+                # generate the list of mutants
+                mutant_list = line_list[0].split(":")
+                valid_mutant = True
+
+                # if any of the mutants in this list aren"t in the focus sequence,
+                #    I cannot make a prediction
+                for mutant in mutant_list:
+                    if mutant not in mutant_to_letter_pos_idx_focus_list:
+                        valid_mutant = False
+
+                # If it is a valid mutant, add it to my list to make preditions
+                if valid_mutant:
+                    focus_seq_copy = list(self.focus_seq_trimmed)[:]
+
+                    for mutant in mutant_list:
+                        wt_aa, pos, idx_focus = mutant_to_letter_pos_idx_focus_list[mutant]
+                        mut_aa = mutant[-1]
+                        focus_seq_copy[idx_focus] = mut_aa
+
+                    self.mutant_sequences.append("".join(focus_seq_copy))
+                    self.mutant_sequences_descriptor.append(":".join(mutant_list))
+
+        INPUT.close()
+
+        # Then make the one hot sequence
+        self.mutant_sequences_one_hot = np.zeros( \
+            (len(self.mutant_sequences), len(self.focus_cols), len(self.alphabet)))
+
+        for i, sequence in enumerate(self.mutant_sequences):
+            for j, letter in enumerate(sequence):
+                k = self.aa_dict[letter]
+                self.mutant_sequences_one_hot[i, j, k] = 1.0
+
+    def pred_from_onehot(self, model, N_pred_iterations=10, minibatch_size=2000, filename_prefix="", offset=0):
+
+        self.prediction_matrix = np.zeros((self.mutant_sequences_one_hot.shape[0], N_pred_iterations))
+
+        tmpr_mutant_sequences_descriptor = self.mutant_sequences_descriptor[:]
+
+        batch_order = np.arange(self.mutant_sequences_one_hot.shape[0])
+
+        for i in range(N_pred_iterations):
+            #             print("i" + str(i))
+            np.random.shuffle(batch_order)
+
+            for j in range(0, self.mutant_sequences_one_hot.shape[0], minibatch_size):
+                #                 print(j)
+
+                batch_index = batch_order[j:j + minibatch_size]
+
+                #                 print(self.mutant_sequences_one_hot[batch_index].shape)
+
+                batch = self.mutant_sequences_one_hot[batch_index]
+
+                batch = batch.reshape(-1, self.alphabet_size * self.seq_len)
+
+                # print(batch.shape)
+
+                batch = torch.Tensor(batch).to(device)
+
+                mu, logsigma, _, logpx_z, z = model(batch)[0:5]
+
+                batch_preds = ELBO_no_mean(logpx_z, mu, logsigma, z, 1.0)
+                #                 print(batch_preds)
+
+                batch_preds_numpy = batch_preds.cpu().numpy()
+
+                #                 print(batch_index.shape)
+
+                for k, idx_batch in enumerate(batch_index.tolist()):
+                    self.prediction_matrix[idx_batch][i] = batch_preds_numpy[k]
+
+        # Then take the mean of all my elbo samples
+        self.mean_elbos = np.mean(self.prediction_matrix, axis=1).flatten().tolist()
+
+        self.wt_elbo = self.mean_elbos.pop(0)
+        tmpr_mutant_sequences_descriptor.pop(0)
+
+        self.delta_elbos = np.asarray(self.mean_elbos) - self.wt_elbo
+
+        if filename_prefix == "":
+            return tmpr_mutant_sequences_descriptor, self.delta_elbos
+
+        else:
+
+            OUTPUT = open(filename_prefix + "_samples-" + str(N_pred_iterations) \
+                          + "_elbo_predictions.csv", "w")
+
+            for i, descriptor in enumerate(tmpr_mutant_sequences_descriptor):
+                OUTPUT.write(descriptor + ";" + str(self.delta_elbos[i]) + "\n")
+
+            OUTPUT.close()
+
+            return tmpr_mutant_sequences_descriptor, self.delta_elbos
+
+    def pred_from_onehot_ensemble(self, model, saved_models, N_pred_iterations=10, minibatch_size=2000, filename_prefix="", offset=0):
+
+        self.prediction_matrix = np.zeros((self.mutant_sequences_one_hot.shape[0], N_pred_iterations))
+
+        tmpr_mutant_sequences_descriptor = self.mutant_sequences_descriptor[:]
+
+        batch_order = np.arange(self.mutant_sequences_one_hot.shape[0])
+
+        for i in range(N_pred_iterations):
+            #             print("i" + str(i))
+            np.random.shuffle(batch_order)
+
+            for j in range(0, self.mutant_sequences_one_hot.shape[0], minibatch_size):
+                #                 print(j)
+
+                batch_index = batch_order[j:j + minibatch_size]
+
+                #                 print(self.mutant_sequences_one_hot[batch_index].shape)
+
+                batch = self.mutant_sequences_one_hot[batch_index]
+
+                batch = batch.reshape(-1, self.alphabet_size * self.seq_len)
+
+                # print(batch.shape)
+
+                batch = torch.Tensor(batch).to(device)
+
+                preds = []
+
+                for best_str in saved_models:
+                    model.load_state_dict(torch.load(opt.saving_path + best_str)['model'])
+
+                    mu, logsigma, _, logpx_z, z, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _ = model(batch)
+
+                    batch_preds = ELBO_no_mean(logpx_z, mu, logsigma, z, 1.0)
+                    #                 print(batch_preds)
+
+                    preds.append(batch_preds.cpu().numpy())
+
+                #                 print(batch_index.shape)
+
+                batch_preds_numpy = np.mean(preds, 0)
+
+                for k, idx_batch in enumerate(batch_index.tolist()):
+                    self.prediction_matrix[idx_batch][i] = batch_preds_numpy[k]
+
+        # Then take the mean of all my elbo samples
+        self.mean_elbos = np.mean(self.prediction_matrix, axis=1).flatten().tolist()
+
+        self.wt_elbo = self.mean_elbos.pop(0)
+        tmpr_mutant_sequences_descriptor.pop(0)
+
+        self.delta_elbos = np.asarray(self.mean_elbos) - self.wt_elbo
+
+        if filename_prefix == "":
+            return tmpr_mutant_sequences_descriptor, self.delta_elbos
+
+        else:
+
+            OUTPUT = open(filename_prefix + "_samples-" + str(N_pred_iterations) \
+                          + "_elbo_predictions.csv", "w")
+
+            for i, descriptor in enumerate(tmpr_mutant_sequences_descriptor):
+                OUTPUT.write(descriptor + ";" + str(self.delta_elbos[i]) + "\n")
+
+            OUTPUT.close()
+
+            return tmpr_mutant_sequences_descriptor, self.delta_elbos
+
+
     def custom_mutant_matrix_pytorch(self, input_filename, model, N_pred_iterations=10, \
             minibatch_size=2000, filename_prefix="", offset=0):
 
@@ -568,7 +782,7 @@ class DataHelper:
         self.mutant_sequences_descriptor = ["wt"]
 
         # run through the input file
-        INPUT = open(self.working_dir+"/"+input_filename, "r")
+        INPUT = open(input_filename, "r")
         for i,line in enumerate(INPUT):
             line = line.rstrip()
             if i >= 1:
@@ -629,9 +843,9 @@ class DataHelper:
 
                 batch = torch.Tensor(batch).to(device)
 
-                mu, logsigma, _, logpx_z, _, _, _, _, _, _, _, _, _, _ ,_,_,_,_,_,_,_,_= model(batch)
+                mu, logsigma, _, logpx_z, z, _, _, _, _, _, _, _, _, _, _ ,_,_,_,_,_,_,_,_= model(batch)
 
-                batch_preds = ELBO_no_mean(logpx_z, mu, logsigma, 1.0)
+                batch_preds = ELBO_no_mean(logpx_z, mu, logsigma, z, 1.0)
 #                 print(batch_preds)
                 
                 batch_preds_numpy = batch_preds.cpu().numpy()

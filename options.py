@@ -16,21 +16,54 @@ class Options():
 
     def initialize(self):
 
+        #Main parameter
+        self.parser.add_argument('--custom_dataset', dest='custom_dataset', action='store_true', default=True)
+        self.parser.add_argument('--dataset_path', type=str, default="BLAT_ECOLX_hmmerbit_plmc_n5_m30_f50_t0.2_r24-286_id100_b105.a2m")
+        self.parser.add_argument('--dataset_id', type=str, default="BLAT_ECOLX")
+        self.parser.add_argument('--phenotype_name', type=str, default="2500")
+        self.parser.add_argument('--mutation_path', type=str, default="./mutations/BLAT_ECOLX_Ranganathan2015.csv")
+        self.parser.add_argument('--theta', type=float, default=0.2)
+        self.parser.add_argument('--epochs', type=int, default=2)
+        self.parser.add_argument('--mutation_iterations', type=int, default=3)
+        self.parser.add_argument('--plot_spearman', dest='plot_spearman', action='store_true', default=True)
+        self.parser.add_argument('--spearman_every', type=int, default=10)
+        self.parser.add_argument('--saving_path', type=str, default="./checkpoint/")
+        self.parser.add_argument('--plots_path', type=str, default="./plots/")
 
         #Training parameter
         self.parser.add_argument('--is_train', dest='is_train', action='store_true', default=True)
+        self.parser.add_argument('--test_algo', dest='test_algo', action='store_true', default=True)
+
+
+        #Importance Weighted Sampler
+        self.parser.add_argument('--k_IWS', type=int, default=50)
+        self.parser.add_argument('--IWS', dest='IWS', action='store_true', default=False)
+        self.parser.add_argument('--IWS_debug', dest='IWS_debug', action='store_true', default=False)
+
+        #Pruning
+        self.parser.add_argument('--prune', dest='prune', action='store_true', default=False)
+        self.parser.add_argument('--prune_encoder', dest='prune_encoder', action='store_true', default=True)
+        self.parser.add_argument('--prune_decoder', dest='prune_decoder', action='store_true', default=False)
+        self.parser.add_argument('--show_mask', dest='show_mask', action='store_true', default=True)
+        self.parser.add_argument('--save_every_rates', dest='save_every_rates', action='store_true', default=False)
+
+        #Stochastic vs Detemrministic Weight
+        self.parser.add_argument('--stoch_det', dest='stoch_det', action='store_true', default=True)
+
 
         #Pytorch parameters
         self.parser.add_argument('--random_seed', type=int, default=42)
         self.parser.add_argument('--warm_up', type=int, default=0)
         self.parser.add_argument('--saving_path', type=str, default="./checkpoint/")
+        self.parser.add_argument('--plots_path', type=str, default="./plots/")
+        self.parser.add_argument('--arrays_path', type=str, default="./arrays/")
         self.parser.add_argument('--save_model_every', type=int, default=30000)
         self.parser.add_argument('--save_plot_every', type=int, default=30000)
         self.parser.add_argument('--save_spearman_every', type=int, default=30000)
         self.parser.add_argument('--continue_training', type=int, default=0)
         self.parser.add_argument('--batch_size', type=int, default=100)
         self.parser.add_argument('--lr', type=float, default=1e-3)
-        self.parser.add_argument('--epochs', type=int, default=100)
+
         self.parser.add_argument('--neff', type=float, default = 0)#535.5874
         self.parser.add_argument('--theano_test', dest='theano_test', action='store_true', default=False)
         self.parser.add_argument('--dropout', type=float, default=0)
